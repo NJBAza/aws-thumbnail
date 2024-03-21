@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Thumbnail generator -- Stori's Data Engineering coding assessment
+            
+Parameters:
+  s3MainBucket:
+    Description: Enter the unique prefix to the name of the S3 main bucket you need to create
+    Type: String
+    Default: mainbucket
+
+  s3SecondaryBucket:
+    Description: Enter the unique prefix to the name of the S3 secondary bucket you need to create
+    Type: String
+    Default: secondarybucket
+  
+Resources:
+  # Original Image Bucket
+  s3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join 
+        - '-'
+        - - !Ref s3MainBucket
+          - !Ref 'AWS::StackName'
+          - !Ref 'AWS::Region'
+  # Thumbnail Bucket
+  ThumbnailBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join 
+        - '-'
+        - - !Ref s3SecondaryBucket
+          - !Ref 'AWS::StackName'
+          - !Ref 'AWS::Region'
+
+  S3CustomResource1:
+    Type: Custom::S3CustomResource # AWS::CloudFormation::CustomResource 
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      bucket_name: !Ref s3Bucket    
+
+  S3CustomResource2:
+    Type: Custom::S3CustomResource # AWS::CloudFormation::CustomResource 
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      bucket_name: !Ref ThumbnailBucket    
+
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: LambdaFunctionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+  LambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: LambdaFunction
+    Properties:
+      RetentionInDays: 1
+      LogGroupName: !Join
+        - ""
+        - -  "/aws/lambda/"
+          - !Ref LambdaFunction
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Timeout: 5
+      Handler: index.handler
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Code: 
+          ZipFile: |
+           import logging
+           import boto3
+           from io import BytesIO
+           from PIL import Image
+           import os
+
+           logger = logging.getLogger()
+           logger.setLevel(logging.INFO)
+
+           def lambda_handler(event, context):
+              logger.info(f"event: {event}")
+              logger.info(f"context: {context}")
+    
+              bucket = event["Records"][0]["s3"]["s3Bucket"]["name"]
+              key = event["Records"][0]["s3"]["object"]["key"]
+
+              thumbnail_bucket = "cp-thumbnail-image-bucket"
+              thumbnail_name, thumbnail_ext = os.path.splitext(key)
+              thumbnail_key = f"{thumbnail_name}_thumbnail{thumbnail_ext}"
+
+              logger.info(f"Bucket name: {s3Bucket}, file name: {key}, Thumbnail Bucket name: {ThumbnailBucket}, file name: {thumbnail_key}")
+
+              s3_client = boto3.client('s3')
+
+              # Load and open image from S3
+              file_byte_string = s3_client.get_object(Bucket=s3Bucket, Key=key)['Body'].read()
+              img = Image.open(BytesIO(file_byte_string))
+              logger.info(f"Size before compression: {img.size}")
+
+              # Generate thumbnail
+              img.thumbnail((500,500), Image.ANTIALIAS)
+              logger.info(f"Size after compression: {img.size}")
+
+              # Dump and save image to S3
+              buffer = BytesIO()
+              img.save(buffer, "JPEG")
+              buffer.seek(0)
+    
+              sent_data = s3_client.put_object(Bucket=ThumbnailBucket, Key=thumbnail_key, Body=buffer)
+
+              if sent_data['ResponseMetadata']['HTTPStatusCode'] != 200:
+                  raise Exception('Failed to upload image {} to bucket {}'.format(key, bucket))
